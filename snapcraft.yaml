@@ -1,11 +1,8 @@
 name: csv2cmi
 version: git
 summary: CSV2CMI
-description: |
-  OfflineIMAP is software that downloads your email mailbox(es) as local
-  Maildirs. OfflineIMAP will synchronize both sides via IMAP.
-
-grade: devel
+description: CSV2CMI is a little program to transform a table of letters (given as .csv) into the CMI format.
+grade: stable
 confinement: devmode
 
 apps:
