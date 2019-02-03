@@ -356,144 +356,159 @@ def createID(id_prefix):
         8)) + '_' + ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(8))
     return fullID
 
+def main():
 
-# simple test for file
-try:
-    open(args.filename, 'rt').close()
-except FileNotFoundError:
-    logging.error('File not found')
-    exit()
-
-# check internet connection via DNB
-connection = checkConnectivity()
-
-# read config file
-config = configparser.ConfigParser()
-# set default values
-config['Project'] = {'editor': '', 'publisher': '', 'fileURL': os.path.splitext(
-    os.path.basename(args.filename))[0] + '.xml'}
-try:
-    config.read_file(open('csv2cmi.ini'))
-except IOError:
-    logging.error('No configuration file found')
-
-
-# building cmi
-# generating root element
-root = Element('TEI')
-root.set('xmlns', 'http://www.tei-c.org/ns/1.0')
-root.append(
-    Comment(' Generated from table of letters with csv2cmi ' + __version__ + ' '))
-
-# teiHeader
-teiHeader = SubElement(root, 'teiHeader')
-# create a file description from config file
-fileDesc = createFileDesc(config)
-teiHeader.append(fileDesc)
-# container for bibliographic data
-global sourceDesc
-sourceDesc = SubElement(fileDesc, 'sourceDesc')
-# filling in correspondance meta-data
-profileDesc = SubElement(teiHeader, 'profileDesc')
-
-with open(args.filename, 'rt') as letterTable:
-    global table
-    table = DictReader(letterTable)
-    logging.debug('Recognized columns: %s', table.fieldnames)
-    if not ('sender' in table.fieldnames and 'addressee' in table.fieldnames):
-        logging.error('No sender/addressee field in table')
+    # simple test for file
+    try:
+        open(args.filename, 'rt').close()
+    except FileNotFoundError:
+        logging.error('File not found')
         exit()
-    edition = ''
-    if not('edition' in table.fieldnames):
-        try:
-            edition = config.get('Edition', 'title')
-        except configparser.Error:
-            logging.warning('No edition stated. Please set manually.')
-        sourceDesc.append(createEdition(edition, createID('edition')))
-    for letter in table:
-        if ('edition' in table.fieldnames):
-            edition = letter['edition'].strip()
-            editionID = getEditonID(edition)
-            if not(edition or args.all):
-                continue
-            if edition and not editionID:
-                editionID = createID('edition')
-                sourceDesc.append(createEdition(edition, editionID))
-        entry = Element('correspDesc')
-        if args.line_numbers:
-            entry.set('n', str(table.line_num))
-        entry.set('xml:id', createID('letter'))
-        if edition:
-            entry.set('source', '#' + editionID)
-        if 'key' in table.fieldnames and letter['key']:
-            if not(edition):
-                logging.error('Key without edition in line %s', table.line_num)
-            else:
-                if 'http://' in str(letter['key']):
-                    entry.set('ref', str(letter['key']).strip())
+
+    # check internet connection via DNB
+    connection = checkConnectivity()
+
+    # read config file
+    global config
+    config = configparser.ConfigParser()
+    # set default values
+    config['Project'] = {'editor': '', 'publisher': '', 'fileURL': os.path.splitext(
+        os.path.basename(args.filename))[0] + '.xml'}
+    try:
+        config.read_file(open('csv2cmi.ini'))
+    except IOError:
+        logging.error('No configuration file found')
+
+
+    # building cmi
+    # generating root element
+    root = Element('TEI')
+    root.set('xmlns', 'http://www.tei-c.org/ns/1.0')
+    root.append(
+        Comment(' Generated from table of letters with csv2cmi ' + __version__ + ' '))
+
+    # teiHeader
+    teiHeader = SubElement(root, 'teiHeader')
+    # create a file description from config file
+    fileDesc = createFileDesc(config)
+    teiHeader.append(fileDesc)
+    # container for bibliographic data
+    global sourceDesc
+    sourceDesc = SubElement(fileDesc, 'sourceDesc')
+    # filling in correspondance meta-data
+    profileDesc = SubElement(teiHeader, 'profileDesc')
+
+    with open(args.filename, 'rt') as letterTable:
+        global table
+        table = DictReader(letterTable)
+        logging.debug('Recognized columns: %s', table.fieldnames)
+        if not ('sender' in table.fieldnames and 'addressee' in table.fieldnames):
+            logging.error('No sender/addressee field in table')
+            exit()
+        edition = ''
+        if not('edition' in table.fieldnames):
+            try:
+                edition = config.get('Edition', 'title')
+            except configparser.Error:
+                logging.warning('No edition stated. Please set manually.')
+            sourceDesc.append(createEdition(edition, createID('edition')))
+        global letter
+        for letter in table:
+            if ('edition' in table.fieldnames):
+                edition = letter['edition'].strip()
+                editionID = getEditonID(edition)
+                if not(edition or args.all):
+                    continue
+                if edition and not editionID:
+                    editionID = createID('edition')
+                    sourceDesc.append(createEdition(edition, editionID))
+            entry = Element('correspDesc')
+            if args.line_numbers:
+                entry.set('n', str(table.line_num))
+            entry.set('xml:id', createID('letter'))
+            if edition:
+                entry.set('source', '#' + editionID)
+            if 'key' in table.fieldnames and letter['key']:
+                if not(edition):
+                    logging.error(
+                        'Key without edition in line %s', table.line_num)
                 else:
-                    entry.set('key', str(letter['key']).strip())
+                    if 'http://' in str(letter['key']):
+                        entry.set('ref', str(letter['key']).strip())
+                    else:
+                        entry.set('key', str(letter['key']).strip())
 
-        # sender info block
-        if letter['sender'] or ('senderPlace' in table.fieldnames and letter['senderPlace']) or letter['senderDate']:
-            action = SubElement(entry, 'correspAction')
-            action.set('xml:id', createID('sender'))
-            action.set('type', 'sent')
+            # sender info block
+            if letter['sender'] or ('senderPlace' in table.fieldnames and letter['senderPlace']) or letter['senderDate']:
+                action = SubElement(entry, 'correspAction')
+                action.set('xml:id', createID('sender'))
+                action.set('type', 'sent')
 
-            # add persName or orgName
-            if letter['sender']:
-                correspondents = createCorrespondent('sender')
-                for sender in correspondents:
-                    action.append(sender)
-            # add placeName
-            if ('senderPlace' in table.fieldnames) and letter['senderPlace']:
-                action.append(createPlaceName('senderPlace'))
-            # add date
-            if 'senderDate' in table.fieldnames and letter['senderDate']:
-                try:
-                    action.append(createDate(letter['senderDate']))
-                except TypeError:
-                    logging.warning(
-                        'Could not parse senderDate in line %s', table.line_num)
-        else:
-            logging.info('No information on sender in line %s', table.line_num)
+                # add persName or orgName
+                if letter['sender']:
+                    correspondents = createCorrespondent('sender')
+                    for sender in correspondents:
+                        action.append(sender)
+                # add placeName
+                if ('senderPlace' in table.fieldnames) and letter['senderPlace']:
+                    action.append(createPlaceName('senderPlace'))
+                # add date
+                if 'senderDate' in table.fieldnames and letter['senderDate']:
+                    try:
+                        action.append(createDate(letter['senderDate']))
+                    except TypeError:
+                        logging.warning(
+                            'Could not parse senderDate in line %s', table.line_num)
+            else:
+                logging.info(
+                    'No information on sender in line %s', table.line_num)
 
-        # addressee info block
-        if letter['addressee'] or ('addresseePlace' in table.fieldnames and letter['addresseePlace']) or ('addresseeDate' in table.fieldnames and letter['addresseeDate']):
-            action = SubElement(entry, 'correspAction')
-            action.set('xml:id', createID('addressee'))
-            action.set('type', 'received')
+            # addressee info block
+            if letter['addressee'] or ('addresseePlace' in table.fieldnames and letter['addresseePlace']) or ('addresseeDate' in table.fieldnames and letter['addresseeDate']):
+                action = SubElement(entry, 'correspAction')
+                action.set('xml:id', createID('addressee'))
+                action.set('type', 'received')
 
-            # add persName or orgName
-            if letter['addressee']:
-                correspondents = createCorrespondent('addressee')
-                for addressee in correspondents:
-                    action.append(addressee)
-            # add placeName
-            if ('addresseePlace' in table.fieldnames) and letter['addresseePlace']:
-                action.append(createPlaceName('addresseePlace'))
-            # add date
-            if 'addresseeDate' in table.fieldnames and letter['addresseeDate']:
-                try:
-                    action.append(createDate(letter['addresseeDate']))
-                except TypeError:
-                    logging.warning(
-                        'Could not parse addresseeDate in line %s', table.line_num)
-        else:
-            logging.info('No information on addressee in line %s',
-                         table.line_num)
-        if args.notes:
-            if ('note' in table.fieldnames) and letter['note']:
-                note = SubElement(entry, 'note')
-                note.set('xml:id', createID('note'))
-                note.text = str(letter['note'])
-        if entry.find('*'):
-            profileDesc.append(entry)
+                # add persName or orgName
+                if letter['addressee']:
+                    correspondents = createCorrespondent('addressee')
+                    for addressee in correspondents:
+                        action.append(addressee)
+                # add placeName
+                if ('addresseePlace' in table.fieldnames) and letter['addresseePlace']:
+                    action.append(createPlaceName('addresseePlace'))
+                # add date
+                if 'addresseeDate' in table.fieldnames and letter['addresseeDate']:
+                    try:
+                        action.append(createDate(letter['addresseeDate']))
+                    except TypeError:
+                        logging.warning(
+                            'Could not parse addresseeDate in line %s', table.line_num)
+            else:
+                logging.info('No information on addressee in line %s',
+                             table.line_num)
+            if args.notes:
+                if ('note' in table.fieldnames) and letter['note']:
+                    note = SubElement(entry, 'note')
+                    note.set('xml:id', createID('note'))
+                    note.text = str(letter['note'])
+            if entry.find('*'):
+                profileDesc.append(entry)
 
-# generate empty body
-root.append(createTextstructure())
+        # generate empty body
+    root.append(createTextstructure())
 
-# save cmi to file
-tree = ElementTree(root)
-tree.write(os.path.splitext(os.path.basename(args.filename))[
-           0] + '.xml', encoding="utf-8", xml_declaration=True, method="xml")
+    # save cmi to file
+    tree = ElementTree(root)
+    tree.write(os.path.splitext(os.path.basename(args.filename))[
+               0] + '.xml', encoding="utf-8", xml_declaration=True, method="xml")
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        logging.warning('Rolling back …')
+        try:
+            sys.exit(0)
+        except SystemExit:
+            os._exit(0)
