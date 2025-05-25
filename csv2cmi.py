@@ -25,7 +25,56 @@ logging.basicConfig(format='%(levelname)s: %(message)s')
 logs = logging.getLogger()
 
 # define RDF namespace
-rdf = {'rdf': 'http://www.w3.org/1999/02/22-rdf-syntax-ns#'}
+RDF_DEFAULT_NAMESPACE = {'rdf': 'http://www.w3.org/1999/02/22-rdf-syntax-ns#'}
+
+# In-memory cache for authority lookups
+AUTHORITY_CACHE = {}
+
+# Default configuration, to be used as fallback
+DEFAULT_AUTHORITY_CONFIG = [
+    {
+        'id': 'viaf',
+        'url_pattern': 'viaf.org', # String to check in person_id_str
+        'rdf_url_suffix': '/rdf.xml',
+        'type_queries': {
+            'organization': './rdf:Description/rdf:type[@rdf:resource="http://schema.org/Organization"]',
+            'person': './rdf:Description/rdf:type[@rdf:resource="http://schema.org/Person"]'
+        },
+        'namespaces': RDF_DEFAULT_NAMESPACE, # VIAF uses the default RDF namespace
+        'error_message_fetch': 'Failed to reach VIAF for %sID %s in line %s',
+        'error_message_parse': '%sID %s in line %s links to unprocessable VIAF authority file'
+    },
+    {
+        'id': 'gnd',
+        'url_pattern': 'd-nb.info/gnd/',
+        'rdf_url_suffix': '/about/rdf',
+        'type_queries': {
+            # Note: ElementTree's find/findall with XPath is limited.
+            # We might need to use .// for broader search or ensure paths are exact.
+            # The original code used get() on a find for rdf:type, which is different.
+            # This configuration assumes direct element matching.
+            'organization': './/{https://d-nb.info/standards/elementset/gnd#}CorporateBody',
+            'person': './/{https://d-nb.info/standards/elementset/gnd#}DifferentiatedPerson',
+        },
+        'person_undifferentiated_type_query': './/{https://d-nb.info/standards/elementset/gnd#}UndifferentiatedPerson',
+        'namespaces': {'gndo': 'https://d-nb.info/standards/elementset/gnd#', 'rdf': 'http://www.w3.org/1999/02/22-rdf-syntax-ns#'},
+        'error_message_fetch': 'Failed to reach GND for %sID %s in line %s',
+        'error_message_parse': '%sID %s in line %s has wrong rdf:type for GND or was unprocessable',
+        'warning_undifferentiated': '%sID %s in line %s links to undifferentiated Person (GND)'
+    },
+    {
+        'id': 'loc',
+        'url_pattern': 'id.loc.gov',
+        'rdf_url_suffix': '.rdf',
+        'type_queries': {
+            'organization': './/{http://id.loc.gov/ontologies/bibframe/}Organization',
+            'person': './/{http://id.loc.gov/ontologies/bibframe/}Person'
+        },
+        'namespaces': {'bf': 'http://id.loc.gov/ontologies/bibframe/', 'rdf': 'http://www.w3.org/1999/02/22-rdf-syntax-ns#'},
+        'error_message_fetch': 'Failed to reach LOC for %sID %s in line %s',
+        'error_message_parse': '%sID %s in line %s links to unprocessable LOC authority file'
+    }
+]
 
 # define arguments
 parser = argparse.ArgumentParser(
@@ -59,6 +108,274 @@ if args.extra_delimiter:
 
 else:
     subdlm = None
+
+# Global variable to hold the active authority configuration
+# Will be populated by load_authority_config_from_ini in main()
+AUTHORITY_CONFIG = []
+GND_PREFIX_URL = 'http://d-nb.info/gnd/' # Default, can be overridden by INI
+
+SUPPORTED_AUTHORITIES = ['gnd', 'viaf', 'loc']
+
+def load_authority_config_from_ini(config_parser, default_config_list):
+    """
+    Loads authority configuration from the INI file.
+    If [AuthorityDetails] is missing or an authority is incompletely configured,
+    it falls back to the default_config_list for that authority or in whole.
+    """
+    new_config = []
+    default_config_map = {conf['id']: conf for conf in default_config_list}
+
+    if not config_parser.has_section('AuthorityDetails'):
+        logging.warning("No [AuthorityDetails] section in csv2cmi.ini. Using default authority configurations.")
+        return default_config_list
+
+    for auth_id in SUPPORTED_AUTHORITIES:
+        try:
+            pattern = config_parser.get('AuthorityDetails', f'{auth_id}_url_pattern', fallback=None)
+            rdf_suffix = config_parser.get('AuthorityDetails', f'{auth_id}_rdf_url_suffix', fallback=None)
+            org_query = config_parser.get('AuthorityDetails', f'{auth_id}_org_query', fallback=None)
+            person_query = config_parser.get('AuthorityDetails', f'{auth_id}_person_query', fallback=None)
+
+            if not all([pattern, rdf_suffix, org_query, person_query]):
+                logging.warning(f"Incomplete configuration for authority '{auth_id}' in csv2cmi.ini. Using default for this authority.")
+                if auth_id in default_config_map:
+                    new_config.append(default_config_map[auth_id])
+                else:
+                    logging.error(f"Default configuration missing for critical authority '{auth_id}'. Skipping.")
+                continue
+
+            current_auth_config = {
+                'id': auth_id,
+                'url_pattern': pattern,
+                'rdf_url_suffix': rdf_suffix,
+                'type_queries': {
+                    'organization': org_query,
+                    'person': person_query
+                },
+                'namespaces': dict(RDF_DEFAULT_NAMESPACE), # Start with default RDF
+                'error_message_fetch': config_parser.get('AuthorityDetails', f'{auth_id}_error_fetch',
+                                                         fallback=default_config_map.get(auth_id, {}).get('error_message_fetch', f"Failed to reach {auth_id.upper()}")),
+                'error_message_parse': config_parser.get('AuthorityDetails', f'{auth_id}_error_parse',
+                                                         fallback=default_config_map.get(auth_id, {}).get('error_message_parse', f"Unprocessable {auth_id.upper()} file")),
+            }
+
+            # GND specific
+            if auth_id == 'gnd':
+                current_auth_config['person_undifferentiated_type_query'] = config_parser.get('AuthorityDetails', 'gnd_undifferentiated_query', fallback=None)
+                current_auth_config['warning_undifferentiated'] = config_parser.get('AuthorityDetails', 'gnd_warning_undifferentiated', 
+                                                                                    fallback=default_config_map.get('gnd',{}).get('warning_undifferentiated','Links to undifferentiated Person (GND)'))
+                gnd_ns_gndo = config_parser.get('AuthorityDetails', 'gnd_namespace_gndo', fallback=None)
+                if gnd_ns_gndo:
+                    current_auth_config['namespaces']['gndo'] = gnd_ns_gndo
+                elif 'gndo' in default_config_map.get('gnd',{}).get('namespaces',{}): # Check default if not in ini
+                    current_auth_config['namespaces']['gndo'] = default_config_map['gnd']['namespaces']['gndo']
+
+
+            # LOC specific
+            if auth_id == 'loc':
+                loc_ns_bf = config_parser.get('AuthorityDetails', 'loc_namespace_bf', fallback=None)
+                if loc_ns_bf:
+                    current_auth_config['namespaces']['bf'] = loc_ns_bf
+                elif 'bf' in default_config_map.get('loc',{}).get('namespaces',{}): # Check default if not in ini
+                     current_auth_config['namespaces']['bf'] = default_config_map['loc']['namespaces']['bf']
+
+
+            # If any special query was mandatory and not found, it could be a reason to fallback for this auth.
+            # Example: if gnd_undifferentiated_query is critical for GND
+            if auth_id == 'gnd' and not current_auth_config['person_undifferentiated_type_query']:
+                 if default_config_map.get('gnd',{}).get('person_undifferentiated_type_query'): # check if default has it
+                    current_auth_config['person_undifferentiated_type_query'] = default_config_map['gnd']['person_undifferentiated_type_query']
+                 else:
+                    logging.warning(f"GND undifferentiated query missing for '{auth_id}' in both INI and defaults. GND processing might be affected.")
+
+
+            new_config.append(current_auth_config)
+
+        except Exception as e:
+            logging.error(f"Error processing configuration for authority '{auth_id}' from csv2cmi.ini: {e}. Using default for this authority.")
+            if auth_id in default_config_map:
+                new_config.append(default_config_map[auth_id])
+            else:
+                logging.error(f"Default configuration missing for critical authority '{auth_id}' during exception. Skipping.")
+    
+    if not new_config: # If all authorities failed to load from INI and no defaults were added (e.g. errors)
+        logging.warning("Failed to load any authority configurations from INI. Reverting to all defaults.")
+        return default_config_list
+        
+    return new_config
+
+
+def _parse_correspondent_string(letter_dict, namestring, subdlm_char):
+    """
+    Parses correspondent strings from the letter dictionary.
+
+    Args:
+        letter_dict (dict): The dictionary representing a row in the CSV.
+        namestring (str): The key for the correspondent field (e.g., 'sender', 'addressee').
+        subdlm_char (str or None): The sub-delimiter character.
+
+    Returns:
+        tuple: A tuple containing two lists: persons (list of name strings) and
+               personIDs (list of ID strings).
+    """
+    if not letter_dict.get(namestring):
+        return [], []
+
+    persons_str = letter_dict[namestring]
+    person_ids_str = letter_dict.get(namestring + "ID", "")
+
+    if subdlm_char:
+        persons = [p.strip() for p in persons_str.split(subdlm_char)]
+        personIDs = [pid.strip() for pid in person_ids_str.split(subdlm_char)]
+    else:
+        persons = [persons_str.strip()]
+        personIDs = [person_ids_str.strip()]
+
+    # Pad personIDs with empty strings if it's shorter than persons
+    if len(personIDs) < len(persons):
+        personIDs.extend([''] * (len(persons) - len(personIDs)))
+
+    return persons, personIDs
+
+
+def _determine_correspondent_type_and_id(person_id_str, namestring, table_line_num, connection, profileDesc, rdf_namespaces):
+    """
+    Determines the correspondent type (persName or orgName) and processes the authority ID.
+
+    Args:
+        person_id_str (str): The authority ID string.
+        namestring (str): The key for the correspondent field (e.g., 'sender', 'addressee').
+        table_line_num (int): The line number in the CSV file.
+        connection (bool): Boolean indicating internet connectivity.
+        profileDesc (xml.etree.ElementTree.Element): The profileDesc XML element.
+
+    Returns:
+        tuple: A tuple containing (element_tag_name, processed_auth_id).
+               element_tag_name is 'persName' or 'orgName'.
+               processed_auth_id is the validated authID or an empty string on failure.
+    """
+    original_person_id_str = person_id_str.strip() # Keep a copy for messages
+
+    if not original_person_id_str:
+        return 'persName', ''
+
+    current_person_id = original_person_id_str
+    # Use the global GND_PREFIX_URL for prefixing
+    if not current_person_id.startswith('http://') and not current_person_id.startswith('https://'):
+        logging.debug('Assuming ID %s is a local ID, prepending GND base URL: %s', current_person_id, GND_PREFIX_URL)
+        current_person_id = GND_PREFIX_URL + current_person_id
+    
+    if not connection:
+        logging.warning("No internet connection. Cannot verify authority ID %s for %s in line %s. Assuming persName.", 
+                        current_person_id, namestring, table_line_num)
+        # No caching if no connection, as lookup is not performed.
+        return 'persName', current_person_id
+
+    # Check cache after connection check and ID normalization
+    if current_person_id in AUTHORITY_CACHE:
+        logging.debug(f"Cache hit for ID: {current_person_id} in line {table_line_num}")
+        return AUTHORITY_CACHE[current_person_id]
+    
+    logging.debug(f"Cache miss for ID: {current_person_id} in line {table_line_num}. Performing lookup.")
+
+    # profileDesc.find logic is omitted here as per instructions for simplification for now.
+
+    for authority_conf in AUTHORITY_CONFIG:
+        if authority_conf['url_pattern'] in current_person_id:
+            rdf_url = current_person_id + authority_conf['rdf_url_suffix']
+            try:
+                with urllib.request.urlopen(rdf_url) as response:
+                    rdf_data = response.read()
+                    rdf_root = ElementTree.fromstring(rdf_data.decode('utf-8'))
+
+                    # Handle GND specific UndifferentiatedPerson check first
+                    if authority_conf['id'] == 'gnd' and authority_conf.get('person_undifferentiated_type_query'):
+                        if rdf_root.find(authority_conf['person_undifferentiated_type_query'], authority_conf['namespaces']):
+                            logging.warning(authority_conf['warning_undifferentiated'],
+                                            namestring, current_person_id, table_line_num)
+                            AUTHORITY_CACHE[current_person_id] = ('persName', '')
+                            return 'persName', ''
+
+                    # Check for organization type
+                    if rdf_root.find(authority_conf['type_queries']['organization'], authority_conf['namespaces']):
+                        AUTHORITY_CACHE[current_person_id] = ('orgName', current_person_id)
+                        return 'orgName', current_person_id
+                    
+                    # Check for person type
+                    if rdf_root.find(authority_conf['type_queries']['person'], authority_conf['namespaces']):
+                        AUTHORITY_CACHE[current_person_id] = ('persName', current_person_id)
+                        return 'persName', current_person_id
+
+                    # If no type determined after checking queries
+                    logging.warning(authority_conf['error_message_parse'],
+                                    namestring, current_person_id, table_line_num)
+                    AUTHORITY_CACHE[current_person_id] = ('persName', '')
+                    return 'persName', ''
+
+            except urllib.error.HTTPError as e:
+                logging.error(authority_conf['error_message_fetch'] + ' (HTTP %s: %s)',
+                              namestring, current_person_id, table_line_num, e.code, e.reason)
+                AUTHORITY_CACHE[current_person_id] = ('persName', '') # Cache failure
+                return 'persName', ''
+            except urllib.error.URLError as e:
+                logging.error(authority_conf['error_message_fetch'] + ' (URL Error: %s)',
+                              namestring, current_person_id, table_line_num, e.reason)
+                AUTHORITY_CACHE[current_person_id] = ('persName', '') # Cache failure
+                return 'persName', ''
+            except ElementTree.ParseError as e:
+                logging.error(authority_conf.get('error_message_parse', 'Failed to parse XML for %sID %s in line %s (authority: %s)') + ': %s',
+                              namestring, current_person_id, table_line_num, authority_conf['id'], e)
+                AUTHORITY_CACHE[current_person_id] = ('persName', '') # Cache failure
+                return 'persName', ''
+            except Exception as e: 
+                logging.error('An unexpected error occurred while processing %sID %s in line %s for authority %s: %s',
+                              namestring, current_person_id, table_line_num, authority_conf['id'], e)
+                AUTHORITY_CACHE[current_person_id] = ('persName', '') # Cache failure
+                return 'persName', ''
+            
+            break 
+    else: 
+        if 'http://' in current_person_id or 'https://' in current_person_id:
+            logging.error('No proper authority record provider identified for %sID %s in line %s. Assuming persName.',
+                          namestring, current_person_id, table_line_num)
+            AUTHORITY_CACHE[current_person_id] = ('persName', '') # Cache this outcome
+            return 'persName', '' 
+    
+    # Fallback: if loop completed without break and person_id was not a URL (so no error logged above)
+    # or some other unhandled case. This should ideally not be reached if current_person_id
+    # was a URL that didn't match any pattern (handled by for/else) or if it was processed.
+    # Caching this default outcome too.
+    logging.debug(f"ID {current_person_id} did not match any authority provider or failed processing. Defaulting and caching.")
+    AUTHORITY_CACHE[current_person_id] = ('persName', '')
+    return 'persName', ''
+
+
+def _create_xml_element_for_correspondent(person_name_str, element_tag_name, auth_id_str, table_line_num):
+    """
+    Creates an XML element for a single correspondent.
+
+    Args:
+        person_name_str (str): The name of the correspondent.
+        element_tag_name (str): The tag name for the element ('persName' or 'orgName').
+        auth_id_str (str): The authority ID, if available.
+        table_line_num (int): The line number in the CSV file (for logging).
+
+    Returns:
+        xml.etree.ElementTree.Element: The created XML element.
+    """
+    correspondent_element = Element(element_tag_name)
+
+    if auth_id_str:
+        correspondent_element.set('ref', auth_id_str)
+
+    person_name_processed = person_name_str.strip()
+    if person_name_processed.startswith('[') and person_name_processed.endswith(']'):
+        correspondent_element.set('evidence', 'conjecture')
+        person_name_processed = person_name_processed[1:-1]
+        logging.info('Added @evidence to <%s> from line %s', element_tag_name, table_line_num)
+
+    correspondent_element.text = person_name_processed
+    return correspondent_element
 
 
 def checkIsodate(datestring):
@@ -144,129 +461,41 @@ def createFileDesc(config):
 
 
 def createCorrespondent(namestring):
-    if letter[namestring]:
-        correspondents = []
-        # Turning the cells of correspondent names and their IDs into lists since cells
-        # can contain various correspondents split by an extra delimiter.
-        # In that case it is essential to be able to call each by their index.
-        if subdlm:
-            persons = letter[namestring].split(subdlm)
-            personIDs = letter[namestring + "ID"].split(subdlm)
-        else:
-            persons = []
-            persons.append(letter[namestring].strip())
-            personIDs = []
-            personIDs.append(letter[namestring + "ID"])
+    """
+    Creates a list of XML elements for correspondents (sender or addressee).
+    """
+    # Global variables used: letter, subdlm, table, connection, profileDesc
+    # These are assumed to be available in the scope, as per the original design.
 
-        for index, person in enumerate(persons):
-            person = str(person).strip()
-            # assigning authority file IDs to their correspondents if provided
-            if personIDs[index] and (index < len(personIDs)):
-                if 'http://' not in str(personIDs[index].strip()):
-                    logging.debug('Assigning ID %s to GND', str(
-                        personIDs[index].strip()))
-                    authID = 'http://d-nb.info/gnd/' + \
-                        str(personIDs[index].strip())
-                else:
-                    authID = str(personIDs[index].strip())
-                if connection and (profileDesc.find('correspDesc/correspAction/persName[@ref="' + authID + '"]') == None):
-                    if 'viaf' in authID:
-                        try:
-                            viafrdf = ElementTree(
-                                file=urllib.request.urlopen(authID + '/rdf.xml'))
-                        except urllib.error.HTTPError:
-                            logging.error(
-                                'Authority file not found for %sID in line %s', namestring, table.line_num)
-                            correspondent = Element('persName')
-                            authID = ''
-                        except urllib.error.URLError:
-                            logging.error('Failed to reach VIAF')
-                            correspondent = Element('persName')
-                        else:
-                            viafrdf_root = viafrdf.getroot()
-                            if viafrdf_root.find('./rdf:Description/rdf:type[@rdf:resource="http://schema.org/Organization"]', rdf) is not None:
-                                correspondent = Element('orgName')
-                            elif viafrdf_root.find('./rdf:Description/rdf:type[@rdf:resource="http://schema.org/Person"]', rdf) is not None:
-                                correspondent = Element('persName')
-                            else:
-                                logging.warning(
-                                    '%sID in line %s links to unprocessable authority file', namestring, table.line_num)
-                                correspondent = Element('persName')
-                                authID = ''
-                    elif 'gnd' in authID:
-                        try:
-                            gndrdf = ElementTree(
-                                file=urllib.request.urlopen(authID + '/about/rdf'))
-                        except urllib.error.HTTPError:
-                            logging.error(
-                                'Authority file not found for %sID in line %s', namestring, table.line_num)
-                            correspondent = Element('persName')
-                            authID = ''
-                        except urllib.error.URLError:
-                            logging.error('Failed to reach GND')
-                            correspondent = Element('persName')
-                        except UnicodeEncodeError:
-                            print(authID)
-                        else:
-                            gndrdf_root = gndrdf.getroot()
-                            rdftype = gndrdf_root.find(
-                                './/rdf:type', rdf).get('{http://www.w3.org/1999/02/22-rdf-syntax-ns#}resource')
-                            if 'Corporate' in rdftype:
-                                correspondent = Element('orgName')
-                            elif 'DifferentiatedPerson' in rdftype:
-                                correspondent = Element('persName')
-                            else:
-                                correspondent = Element('persName')
-                                logging.error(
-                                    '%sID in line %s has wrong rdf:type', namestring, table.line_num)
-                            if 'UndifferentiatedPerson' in rdftype:
-                                logging.warning(
-                                    '%sID in line %s links to undifferentiated Person', namestring, table.line_num)
-                                authID = ''
-                    elif 'loc' in authID:
-                        try:
-                            locrdf = ElementTree(
-                                file=urllib.request.urlopen(authID + '.rdf'))
-                        except urllib.error.HTTPError:
-                            logging.error(
-                                'Authority file not found for %sID in line %s', namestring, table.line_num)
-                            correspondent = Element('persName')
-                            authID = ''
-                        except urllib.error.URLError:
-                            logging.error('Failed to reach LOC')
-                            correspondent = Element('persName')
-                        else:
-                            locrdf_root = locrdf.getroot()
-                            if locrdf_root.find('.//rdf:type[@rdf:resource="http://id.loc.gov/ontologies/bibframe/Organization"]', rdf) is not None:
-                                correspondent = Element('orgName')
-                            elif locrdf_root.find('.//rdf:type[@rdf:resource="http://id.loc.gov/ontologies/bibframe/Person"]', rdf) is not None:
-                                correspondent = Element('persName')
-                            else:
-                                logging.warning(
-                                    '%sID in line %s links to unprocessable authority file', namestring, table.line_num)
-                                correspondent = Element('persName')
-                                authID = ''
-                    else:
-                        logging.error(
-                            'No proper authority record in line %s for %s', table.line_num, namestring)
-                        correspondent = Element(action, 'persName')
-                        authID = ''
-                else:
-                    correspondent = Element('persName')
-                if authID:
-                    correspondent.set('ref', authID)
-            else:
-                logging.debug('ID for "%s" missing in line %s',
-                              person, table.line_num)
-                correspondent = Element('persName')
-            if person.startswith('[') and person.endswith(']'):
-                correspondent.set('evidence', 'conjecture')
-                person = person[1:-1]
-                logging.info('Added @evidence to <%s> from line %s', correspondent.tag,
-                             table.line_num)
-            correspondent.text = person
-            correspondents.append(correspondent)
-    return(correspondents)
+    persons, personIDs = _parse_correspondent_string(
+        letter, namestring, subdlm)
+
+    if not persons:
+        return []
+
+    correspondent_elements = []
+    for index, person_name in enumerate(persons):
+        person_id = personIDs[index] if index < len(personIDs) else ""
+
+            # Pass RDF_DEFAULT_NAMESPACE to the function
+        element_tag, processed_id = _determine_correspondent_type_and_id(
+            person_id,
+            namestring,
+            table.line_num,
+            connection,
+                profileDesc, # profileDesc is still passed but not used for pre-check in the refactored version
+                RDF_DEFAULT_NAMESPACE
+        )
+
+        xml_element = _create_xml_element_for_correspondent(
+            person_name,
+            element_tag,
+            processed_id,
+            table.line_num
+        )
+        correspondent_elements.append(xml_element)
+
+    return correspondent_elements
 
 
 def createDate(dateString):
@@ -369,15 +598,31 @@ def main():
     connection = checkConnectivity()
 
     # read config file
-    global config
-    config = configparser.ConfigParser()
-    # set default values
-    config['Project'] = {'editor': '', 'publisher': '', 'fileURL': os.path.splitext(
+    global config, AUTHORITY_CONFIG, GND_PREFIX_URL
+    config_parser = configparser.ConfigParser()
+    # set default values for Project section, others might come from ini or defaults
+    config_parser['Project'] = {'editor': '', 'publisher': '', 'fileURL': os.path.splitext(
         os.path.basename(args.filename))[0] + '.xml'}
+    
+    ini_path = 'csv2cmi.ini'
     try:
-        config.read_file(open('csv2cmi.ini'))
+        with open(ini_path, 'rt') as f:
+            config_parser.read_file(f)
+        logging.info(f"Successfully read configuration from {ini_path}")
     except IOError:
-        logging.error('No configuration file found')
+        logging.warning(f"{ini_path} not found. Using default settings for project and authority configurations.")
+        # Keep config_parser as it is (with only Project defaults)
+
+    # Update global config to be this instance
+    config = config_parser
+
+    # Load authority configurations
+    AUTHORITY_CONFIG = load_authority_config_from_ini(config, DEFAULT_AUTHORITY_CONFIG)
+    
+    # Update GND_PREFIX_URL from INI if available
+    GND_PREFIX_URL = config.get('AuthorityDetails', 'gnd_default_prefix', fallback=GND_PREFIX_URL)
+    if GND_PREFIX_URL != 'http://d-nb.info/gnd/' : # Log if it changed from compile-time default
+        logging.info(f"GND prefix URL set to: {GND_PREFIX_URL} from INI file.")
 
 
     # building cmi
