@@ -66,18 +66,17 @@ parser.add_argument("--extra-delimiter", help="delimiter for different values wi
 def is_datable_iso(date_string) -> bool:
     """Check if a string is from datatype teidata.temporal.iso."""
     try:
-        datetime.strptime(date_string, "%Y-%m-%d")
+        if len(date_string) == 10:
+            datetime.strptime(date_string, "%Y-%m-%d")
+        elif len(date_string) == 7:
+            datetime.strptime(date_string, "%Y-%m")
+        elif len(date_string) == 4:
+            datetime.strptime(date_string, "%Y")
+        else:
+            return False
         return True
     except ValueError:
-        try:
-            datetime.strptime(date_string, "%Y-%m")
-            return True
-        except ValueError:
-            try:
-                datetime.strptime(date_string, "%Y")
-                return True
-            except ValueError:
-                return False
+        return False
 
 
 def is_datable_w3c(date_string) -> bool:
@@ -185,7 +184,9 @@ class CMI:
                 return bibliographic_entry.get("xml:id")
         return None
 
-    def create_correspondent(self, name_string: str) -> list:
+    def create_correspondent(
+        self, letter: dict, name_string: str, subdlm: Optional[str] = None, line_num: Optional[int] = None
+    ) -> list:
         """Create a correspondent."""
         if letter[name_string]:
             correspondent_list: list = []
@@ -228,9 +229,7 @@ class CMI:
                             try:
                                 viafrdf = ElementTree(file=urllib.request.urlopen(authority_file_uri + "/rdf.xml"))
                             except urllib.error.HTTPError:
-                                logging.error(
-                                    "Authority file not found for %sID in line %s", name_string, table.line_num
-                                )
+                                logging.error("Authority file not found for %sID in line %s", name_string, line_num)
                             except urllib.error.URLError as connection_issue:
                                 logging.error("Failed to reach VIAF (%s)", str(connection_issue.reason))
                             else:
@@ -254,15 +253,13 @@ class CMI:
                                     logging.warning(
                                         "%sID in line %s links to unprocessable authority file",
                                         name_string,
-                                        table.line_num,
+                                        line_num,
                                     )
                         elif "gnd" in authority_file_uri:
                             try:
                                 gndrdf = ElementTree(file=urllib.request.urlopen(authority_file_uri + "/about/rdf"))
                             except urllib.error.HTTPError:
-                                logging.error(
-                                    "Authority file not found for %sID in line %s", name_string, table.line_num
-                                )
+                                logging.error("Authority file not found for %sID in line %s", name_string, line_num)
                             except urllib.error.URLError as connection_issue:
                                 logging.error("Failed to reach GND (%s)", str(connection_issue.reason))
                             except UnicodeEncodeError:
@@ -290,17 +287,15 @@ class CMI:
                                         logging.warning(
                                             "%sID in line %s links to undifferentiated Person",
                                             name_string,
-                                            table.line_num,
+                                            line_num,
                                         )
                                     else:
-                                        logging.error("%sID in line %s has wrong rdf:type", name_string, table.line_num)
+                                        logging.error("%sID in line %s has wrong rdf:type", name_string, line_num)
                         elif "loc" in authority_file_uri:
                             try:
                                 locrdf = ElementTree(file=urllib.request.urlopen(authority_file_uri + ".rdf"))
                             except urllib.error.HTTPError:
-                                logging.error(
-                                    "Authority file not found for %sID in line %s", name_string, table.line_num
-                                )
+                                logging.error("Authority file not found for %sID in line %s", name_string, line_num)
                             except urllib.error.URLError as connection_issue:
                                 logging.error("Failed to reach LOC (%s)", str(connection_issue.reason))
                             else:
@@ -323,27 +318,25 @@ class CMI:
                                     correspondent = Element("persName")
                                 else:
                                     logging.warning(
-                                        "%sID in line %s links to unprocessable authority file",
-                                        name_string,
-                                        table.line_num,
+                                        "%sID in line %s links to unprocessable authority file", name_string, line_num
                                     )
                         else:
                             authority_file_uri = ""
-                            logging.error("No proper authority record in line %s for %s", table.line_num, name_string)
+                            logging.error("No proper authority record in line %s for %s", line_num, name_string)
                     if authority_file_uri:
                         correspondent.set("ref", authority_file_uri)
                 else:
-                    logging.debug('ID for "%s" missing in line %s', person, table.line_num)
+                    logging.debug('ID for "%s" missing in line %s', person, line_num)
                 if person.startswith("[") and person.endswith("]"):
                     correspondent.set("evidence", "conjecture")
                     person = person[1:-1]
-                    logging.info("Added @evidence to <%s> from line %s", correspondent.tag, table.line_num)
+                    logging.info("Added @evidence to <%s> from line %s", correspondent.tag, line_num)
                 correspondent.text = person
                 correspondent_list.append(correspondent)
         return correspondent_list
 
     @staticmethod
-    def create_corresp_action(letter: dict, correnspondent: Correspondents) -> Element:
+    def create_corresp_action(letter: dict, correnspondent: Correspondents, line_num: int) -> Element:
         """Create a correspondence action."""
         action = Element("correspAction")
         action.set("xml:id", cmi_object.generate_id(correnspondent))
@@ -352,11 +345,13 @@ class CMI:
 
         # add name of sender
         if letter[correnspondent]:
-            correspondents = cmi_object.create_correspondent(correnspondent)
+            correspondents = cmi_object.create_correspondent(
+                letter=letter, name_string=correnspondent, subdlm=subdlm, line_num=line_num
+            )
             for sender in correspondents:
                 action.append(sender)
         # add place_name
-        senderPlace = cmi_object.process_place(letter, correnspondent)
+        senderPlace = cmi_object.process_place(letter, correnspondent, line_num)
         if senderPlace.attrib or senderPlace.text:
             action.append(senderPlace)
         # add date
@@ -369,17 +364,16 @@ class CMI:
     @staticmethod
     def create_date(date_string: Optional[str]) -> Optional[Element]:
         """Convert an EDTF date into a proper TEI element."""
+        if not date_string:
+            return None
         # normalize date
         normalized_date = date_string.translate(date_string.maketrans("", "", "?~%"))
-        if not normalized_date:
-            return None
         tei_date = Element("date")
-        if len(normalized_date) > 4 and normalized_date[-1] == "X":
+        if "XX" in normalized_date:
             # remove day and month with unspecified digits
-            normalized_date = normalized_date[0:-3]
-            if normalized_date[-1] == "X":
-                normalized_date = normalized_date[0:-3]
-        if normalized_date[-1] == "X":
+            normalized_date = normalized_date.replace("XX", "01")
+            tei_date.set("from", normalized_date.replace("-01-01", ""))
+        elif normalized_date.endswith("X"):
             # convert year with unspecified digits into interval
             normalized_date = normalized_date.replace("X", "0") + "/" + normalized_date.replace("X", "9")
         if normalized_date.startswith("[") and normalized_date.endswith("]"):
@@ -412,19 +406,20 @@ class CMI:
         if tei_date.attrib:
             if normalized_date != date_string:
                 tei_date.set("cert", "low")
-                logging.info("Added @cert to <date> from line %s", table.line_num)
             return tei_date
         raise ValueError(f'unable to parse "{date_string}" as TEI date')
 
     @staticmethod
-    def create_place_name(place_name_text: str, geonames_uri: Optional[str] = None) -> Element:
+    def create_place_name(
+        place_name_text: str, geonames_uri: Optional[str] = None, line_num: Optional[int] = None
+    ) -> Element:
         """Create a placeName element."""
         place_name = Element("placeName")
         place_name_text = place_name_text.strip()
         if place_name_text.startswith("[") and place_name_text.endswith("]"):
             place_name.set("evidence", "conjecture")
             place_name_text = place_name_text[1:-1]
-            logging.info("Added @evidence to <placeName> from line %s", table.line_num)
+            logging.info("Added @evidence to <placeName> from line %s", line_num)
         place_name.text = str(place_name_text)
         if geonames_uri:
             geonames_uri = geonames_uri.strip()
@@ -469,11 +464,11 @@ class CMI:
             pass
         return correspDate
 
-    def process_place(self, letter: dict, correspondent: Correspondents) -> Element:
+    def process_place(self, letter: dict, correspondent: Correspondents, line_num: int) -> Element:
         """Process place."""
         place_name = letter.get(correspondent + "Place", "")
         place_id = letter.get(correspondent + "PlaceID")
-        return self.create_place_name(place_name, place_id)
+        return self.create_place_name(place_name, place_id, line_num)
 
     def replace_short_titles(self, project: configparser) -> None:
         """Replace short titles by full title defined in config file."""
@@ -625,7 +620,9 @@ if __name__ == "__main__":
                     or (correnspondent + "Place" in table.fieldnames and letter[correnspondent + "Place"])
                     or (correnspondent + "Date" in table.fieldnames and letter[correnspondent + "Date"])
                 ):
-                    action = cmi_object.create_corresp_action(correnspondent=correnspondent, letter=letter)
+                    action = cmi_object.create_corresp_action(
+                        correnspondent=correnspondent, letter=letter, line_num=table.line_num
+                    )
                     entry.append(action)
                 else:
                     logging.info("No information on %s in line %s", correnspondent, table.line_num)

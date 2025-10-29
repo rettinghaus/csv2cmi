@@ -1,0 +1,4 @@
+sender,senderID,senderPlace,senderPlaceID,senderDate,addressee,addresseeID,addresseePlace,addresseePlaceID,edition,key,note
+Sender1,sid1,SenderPlace1,spid1,2024-01-01,Addressee1,aid1,AddresseePlace1,apid1,Edition1,key1,This is a test note.
+Sender2,sid2,SenderPlace2,spid2,2024-01-02,Addressee2,aid2,AddresseePlace2,apid2,,key2,This is another test note.
+Sender3a;Sender3b,sid3,SenderPlace3,spid3,2024-01-03,Addressee3,aid3,AddresseePlace3,apid3,Edition3,key3,Note3
