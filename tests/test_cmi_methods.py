@@ -1,6 +1,5 @@
 import pytest
-from unittest.mock import patch, Mock
-from xml.etree import ElementTree
+from unittest.mock import patch
 from io import BytesIO
 
 from csv2cmi import CMI, is_datable_iso, is_datable_w3c
